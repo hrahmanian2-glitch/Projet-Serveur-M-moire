@@ -1,0 +1,118 @@
+=== Étape 6.1 - La librairie remotememory ===
+
+--- Rôle des différentes méthodes ---
+
+__init__ : initialise l'objet RemoteMemory. Elle stocke le host, le port,
+le nom du segment et la taille. Si alloc=True (par défaut), elle envoie
+une requête PUT au serveur pour créer le segment dès la création de l'objet.
+
+request : méthode utilisée par toutes les autres. Elle ouvre une connexion
+TCP avec le serveur, envoie la commande, récupère la réponse, ferme la
+connexion et retourne la réponse. Si la réponse commence par "error",
+une exception ValueError est levée.
+
+__getitem__ : appelée quand on écrit mem[i]. Elle envoie GET au serveur
+et retourne la valeur reçue convertie en entier.
+
+__setitem__ : appelée quand on écrit mem[i] = valeur. Elle envoie POST
+au serveur avec l'index et la valeur.
+
+__len__ : retourne la taille du segment. Appelée quand on écrit len(mem).
+
+free : envoie DELETE au serveur pour libérer le segment. A utiliser quand
+on n'a plus besoin de la mémoire et qu'on n'utilise pas with.
+
+__enter__ : retourne l'objet lui-même (self) sans envoyer de commande
+au serveur. Appelée automatiquement au début d'un bloc with.
+
+__exit__ : envoie DELETE au serveur pour supprimer le segment. Appelée
+automatiquement à la fin d'un bloc with, même si une exception s'est
+produite dans le bloc.
+
+--- Le context manager ---
+
+Les méthodes __enter__ et __exit__ font de RemoteMemory un context manager
+Python. Cela permet de l'utiliser avec l'instruction with. L'avantage
+principal est que le segment est toujours supprimé proprement à la fin
+du bloc with, même en cas d'erreur, sans avoir à appeler free() manuellement.
+
+--- Test effectué ---
+
+J'ai lancé le serveur en arrière-plan puis ouvert un interprète Python :
+
+    python3 server_mem.py 1024 12345 &
+    python3
+
+    >>> from remotememory import RemoteMemory
+    >>> with RemoteMemory("localhost", 12345, "seg0", 512, debug=True) as mem:
+    ...     mem[3] = 42
+    ...     print(mem[3])
+
+J'ai observé dans les messages debug :
+1. PUT seg0 512 est envoyé lors de la création de l'objet dans __init__
+2. POST seg0 3 42 est envoyé quand j'écris mem[3] = 42
+3. GET seg0 3 est envoyé quand je lis mem[3], qui retourne bien 42
+4. DELETE seg0 est envoyé automatiquement à la sortie du bloc with via __exit__
+
+Ce test confirme que __enter__ et __exit__ fonctionnent correctement
+et que le segment est bien libéré automatiquement.
+
+=== Étape 6.2 - Deux clients en parallèle, segments différents ===
+
+Question : risque-t-on d'observer une corruption mémoire ?
+
+Réponse : Non. Les deux clients travaillent sur des segments différents
+(seg0 et seg1). Ils n'accèdent jamais aux mêmes adresses physiques en
+mémoire. Il n'y a donc aucun risque de corruption.
+
+Vérification expérimentale :
+J'ai lancé deux clients en parallèle avec un nombre d'accès suffisant
+pour que chaque client tourne environ une minute :
+    python3 client.py localhost 12345 seg0 200 --num_accesses 50000 &
+    python3 client.py localhost 12345 seg1 200 --num_accesses 50000 &
+
+Les deux clients ont terminé sans erreur (done), ce qui confirme
+qu'aucune corruption n'a été détectée. C'est conforme à ce qu'on
+attendait.
+
+Note : lors d'un premier test, une erreur est apparue :
+ValueError: invalid literal for int() with base 10: 'ok'
+Les réponses de deux clients se mélangeaient dans les pipes.
+J'ai corrigé server_mem.py en lisant la réponse complète jusqu'au
+'\n' avant de l'envoyer au client. Après correction, aucune
+corruption n'a été détectée.
+
+J'ai mesuré qu'avec 500000 accès, un client tourne en environ
+1 minute 10 secondes (mesuré avec la commande time).
+
+=== Étape 6.3 - Segment partagé ===
+
+Question : risque-t-on d'observer une corruption mémoire ?
+
+Réponse : Oui. Quand deux clients travaillent sur le même segment,
+ils peuvent écraser les valeurs de l'autre. Le client A écrit une
+valeur à un index, puis le client B écrit une valeur différente au
+même index. Quand le client A relit cet index, il obtient une valeur
+différente de celle qu'il avait écrite — corruption détectée par
+ControledMemory.
+
+Vérification expérimentale :
+Nous avons lancé deux clients sur le même segment :
+    python3 client.py localhost 12345 seg0 512 --num_accesses 5000 &
+    python3 client.py localhost 12345 seg0 512 --num_accesses 5000 --no-alloc &
+
+Deux types d'erreurs ont été observés, tous les deux attendus :
+
+1. Memory corruption detected at index 262: expected 188, got 111
+   Le client 2 avait écrasé la valeur écrite par le client 1 au même
+   index. ControledMemory a détecté que la valeur lue était différente
+   de la valeur écrite.
+
+2. error: segment seg0 does not exist
+   Le client 1 a terminé avant le client 2 et a supprimé le segment.
+   Le client 2 a donc essayé d'accéder à un segment qui n'existait plus.
+
+Ces deux erreurs sont inévitables sans mécanisme de synchronisation
+entre les deux clients. Le serveur fonctionne correctement — le
+problème vient de l'accès concurrent au même segment sans coordination.
+Aucune modification du serveur n'était nécessaire.

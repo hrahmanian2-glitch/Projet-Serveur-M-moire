@@ -1,0 +1,73 @@
+=== Étape 7 - Client avec mise en cache ===
+
+--- Degré d'avancement ---
+
+Le code est complet et fonctionnel. Le client fonctionne sans erreur
+avec le cache activé et les performances sont nettement améliorées.
+
+--- Modifications effectuées ---
+
+server_mem_frontend.py :
+- PUT accepte maintenant un 4ème argument pagesize qui est stocké
+  dans la table des segments
+- GET prend un numéro de page et non plus un index, calcule l'offset
+  physique (pagenum * pagesize) et l'envoie au backend
+- POST prend un numéro de page et le contenu complet en hex, calcule
+  l'offset physique et l'envoie au backend
+
+server_mem_backend.py :
+- GET reçoit un offset et une taille de page, lit les octets
+  correspondants et retourne le résultat en hexadécimal
+- POST reçoit un offset, une taille de page et des données en hex,
+  écrit les octets correspondants en mémoire
+
+remotememory.py :
+- ajout des paramètres pagesize=8 et cachesize=64
+- cache local : dictionnaire {pagenum: {data: bytearray, dirty: bool}}
+- _load_page : charge une page depuis le serveur si pas en cache,
+  évince une page si le cache est plein
+- _flush_page : envoie une page au serveur via POST si dirty=True
+- _flush : envoie toutes les pages dirty avant DELETE
+- __getitem__ : charge la page si absente, retourne l'octet
+- __setitem__ : charge la page si absente, modifie l'octet,
+  marque dirty=True
+
+client.py :
+- ajout des arguments --pagesize et --cachesize en ligne de commande
+
+--- Algorithme de remplacement ---
+
+J'utilise l'algorithme FIFO (First In First Out). La page la plus
+ancienne dans le cache est remplacée en premier quand le cache est
+plein et qu'une nouvelle page doit être chargée.
+
+Le bit de saleté (dirty) est utilisé pour améliorer les performances :
+- si dirty=False : la page n'a pas été modifiée localement, elle est
+  identique à la version sur le serveur. On peut la supprimer du cache
+  sans aucune connexion TCP.
+- si dirty=True : la page a été modifiée localement. Elle doit être
+  envoyée au serveur via POST avant d'être supprimée du cache, pour
+  ne pas perdre les modifications.
+
+Cela améliore les performances car les pages non modifiées (lectures
+seules) sont supprimées gratuitement sans connexion réseau.
+
+--- Gain de performance mesuré ---
+
+Mesuré avec la commande time :
+
+Sans cache (étape 6) :
+    time python3 client.py localhost 12345 seg0 512 --num_accesses 500000
+    → 1 minute 10 secondes (70 secondes)
+
+Avec cache (pagesize=8, cachesize=64) :
+    time python3 client.py localhost 12345 seg0 512 --num_accesses 500000
+    → 7.75 secondes
+
+Gain : 70 / 7.75 ≈ 9x plus rapide
+
+Le gain vient de deux facteurs :
+1. Une page de 8 octets est chargée en une seule connexion TCP au
+   lieu de 8 connexions séparées.
+2. Avec sigma=3, les accès sont locaux — la même page est souvent
+   réutilisée plusieurs fois de suite sans aucune connexion réseau.
